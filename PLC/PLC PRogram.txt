@@ -1,0 +1,453 @@
+/*
+Siemens S7-1500 PLC Program
+Project: Hybrid Solar / Battery / Grid / Generator Dewatering System
+Language: IEC 61131-3 Structured Text (SCL) with descriptions, FB templates,
+Data Blocks and IO mapping suggestions suitable for Siemens TIA Portal (S7-1500).
+
+This document contains:
+ - System assumptions and I/O mapping (suggested addresses)
+ - Data block designs
+ - Function Block (FB) interfaces and sample SCL code for:
+    * FB_PowerManager (priority switching + contactor interlocks)
+    * FB_GeneratorController (auto start/stop sequence)
+    * FB_VFD_Controller (speed setpoint & start/stop)
+    * FB_SolarCleaner (dust detect & spray control)
+    * FB_AlarmManager
+ - OB1 main program structure and call pattern
+ - HMI / SCADA tag suggestions
+ - Commissioning & test checklist
+
+Notes:
+ - Adapt I/O addresses to the real IO modules used (ET200 / SM modules)
+ - VFD communication normally via Modbus TCP / Profinet; below we use variables
+ - Replace "%IW, %Q" placeholders if you use tag names in TIA Portal
+ - Safety-related code must be validated and reviewed by a functional safety engineer
+*/
+
+// ---------------------- System assumptions ----------------------
+// CPU: Siemens S7-1500 (e.g., CPU 1516-3 PN/DP)
+// IO: Mix of digital & analog inputs, digital outputs, and communication modules
+// VFD: Controlled via Modbus TCP or Profinet (set speed, start/stop, read faults)
+// BMS: Battery Management using Modbus/CAN (SOC, voltage, current)
+// Grid detect: digital or analog voltage measurement + frequency measurement
+// Generator: start/stop via digital output to starter relay; run feedback via digital input
+// HMI: Profinet HMI / WinCC for local display; OPC UA / MQTT to cloud optional
+
+// ---------------------- Suggested IO mapping (example) ----------------------
+// Digital Inputs (DI)
+// %I0.0  Grid_Present
+// %I0.1  Generator_RunFeedback
+// %I0.2  Emergency_Stop
+// %I0.3  Solar_Dust_Detected
+// %I0.4  Tracker_LimitLeft
+// %I0.5  Tracker_LimitRight
+// %I0.6  Panel_Stow_Req
+// %I0.7  VFD_Fault
+
+// Analog Inputs (AI) - mapped to PI/AI modules
+// %IW128  PV_String1_Voltage (mV or V * 1000)
+// %IW130  PV_String1_Current (mA or A * 100)
+// %IW132  Battery_Voltage
+// %IW134  Battery_SOC (0-1000 -> 0.0-100.0%)
+// %IW136  Grid_Voltage
+// %IW138  Grid_Frequency
+// %IW140  Pump_Current
+
+// Digital Outputs (DO)
+// %Q0.0  Contactor_Solar (close solar relay)
+// %Q0.1  Contactor_Battery
+// %Q0.2  Contactor_Grid
+// %Q0.3  Genset_Start_Relay
+// %Q0.4  Genset_Stop_Relay
+// %Q0.5  Spray_Cleaner_Valve
+// %Q0.6  Tracker_Motor_CW
+// %Q0.7  Tracker_Motor_CCW
+// %Q0.8  Alarm_Buzzer
+
+// ---------------------- Data Blocks ----------------------
+// DB_SystemStatus : current selected source, errors, timestamps
+// DB_PowerStats : PV_power, Battery_power, Grid_power, Pump_demand
+// DB_Config : thresholds and timers (SOC_low, SOC_high, PV_min, grid_ok_v_min, generator_autostart_enable)
+
+// ---------------------- TYPE Definitions ----------------------
+TYPE SupplySource : (
+  src_None := 0,
+  src_Solar := 1,
+  src_Battery := 2,
+  src_Grid := 3,
+  src_Generator := 4
+);
+END_TYPE
+
+// ---------------------- FB: Power Manager ----------------------
+// Responsibilities:
+//  - Evaluate PV, Battery, Grid availability and decide the selected power source
+//  - Handle contactor interlocks to avoid paralleling incompatible sources
+//  - Provide commands for generator auto-start if all other sources fail
+
+FUNCTION_BLOCK FB_PowerManager
+VAR_INPUT
+  PV_power_kW  : REAL;        // instantaneous PV power
+  PV_voltage   : REAL;        // PV voltage
+  Battery_SOC  : REAL;        // percentage 0..100
+  Battery_voltage : REAL;     // V
+  Grid_Avail   : BOOL;        // true if grid is present & healthy
+  Grid_voltage : REAL;        // measured grid voltage
+  Grid_freq    : REAL;        // measured grid frequency
+  Genset_Running : BOOL;      // generator run feedback
+  Pump_demand_kW : REAL;      // desired pump consumption (from HMI/level control)
+  AutoGenEnable  : BOOL;      // allow auto start of generator
+END_VAR
+VAR_OUTPUT
+  SelectedSource : SupplySource; // chosen source
+  Cmd_Contactor_Solar : BOOL; // request to close solar contactor
+  Cmd_Contactor_Battery : BOOL;
+  Cmd_Contactor_Grid : BOOL;
+  Cmd_Start_Generator : BOOL; // pulse to generator controller
+  ReasonText : STRING[80];
+END_VAR
+VAR
+  // internal timers and states
+  tDelaySwitch    : TON; // prevent fast cycling
+  hysteresisSoc   : REAL;
+  lastSelected    : SupplySource;
+  pv_ok           : BOOL;
+  batt_ok         : BOOL;
+  grid_ok         : BOOL;
+  tryStartGen     : BOOL;
+END_VAR
+
+// Initialization block (called automatically by TIA on first cycle)
+// (In TIA Portal you'd create an initialization OB or set default DB values)
+
+// Main logic
+// Simple priority with hysteresis and anti-chatter timer
+IF NOT tDelaySwitch.IN THEN
+  tDelaySwitch(IN := FALSE, PT := T#0s);
+END_IF
+
+// evaluate availability
+pv_ok := (PV_power_kW >= 0.5) AND (PV_voltage > 50.0); // example thresholds - tune in DB_Config
+batt_ok := (Battery_SOC >= 30.0); // battery usable threshold
+grid_ok := Grid_Avail AND (Grid_voltage > 200.0) AND (Grid_freq > 48.0) AND (Grid_freq < 52.0);
+
+// priority logic
+// 1. Solar if PV producing enough and system configured to use it
+IF pv_ok THEN
+  SelectedSource := src_Solar;
+  ReasonText := 'Solar available';
+ELSIF batt_ok THEN
+  SelectedSource := src_Battery;
+  ReasonText := 'Battery SOC sufficient';
+ELSIF grid_ok THEN
+  SelectedSource := src_Grid;
+  ReasonText := 'Grid available';
+ELSE
+  SelectedSource := src_None;
+  ReasonText := 'No primary source';
+END_IF
+
+// if no source and auto-gen enabled -> request generator start
+Cmd_Start_Generator := FALSE;
+IF (SelectedSource = src_None) AND AutoGenEnable THEN
+  // only request start if generator not already running
+  IF NOT Genset_Running THEN
+    Cmd_Start_Generator := TRUE;
+    ReasonText := CONCAT(ReasonText, ' -> Request Gen Start');
+  ELSE
+    SelectedSource := src_Generator;
+    ReasonText := CONCAT(ReasonText, ' -> Gen Running');
+  END_IF
+END_IF
+
+// set contactor commands (mutually exclusive)
+Cmd_Contactor_Solar := (SelectedSource = src_Solar);
+Cmd_Contactor_Battery := (SelectedSource = src_Battery);
+Cmd_Contactor_Grid := (SelectedSource = src_Grid);
+
+// if generator chosen, ensure grid and solar contactors open
+IF SelectedSource = src_Generator THEN
+  Cmd_Contactor_Solar := FALSE;
+  Cmd_Contactor_Battery := FALSE;
+  Cmd_Contactor_Grid := FALSE;
+END_IF
+
+END_FUNCTION_BLOCK
+
+// ---------------------- FB: Generator Controller ----------------------
+// Responsibilities:
+//  - Execute generator start sequence (energize start relay, monitor run feedback)
+//  - Implement retries, timeouts and safety interlocks
+//  - Provide status to HMI
+
+FUNCTION_BLOCK FB_GeneratorController
+VAR_INPUT
+  AutoStartRequest : BOOL;    // request coming from PowerManager
+  ManualStartCmd   : BOOL;    // operator manual start button
+  Generator_RunFeedback : BOOL; // digital input from genset indicating running
+  EStop            : BOOL;    // emergency stop
+END_VAR
+VAR_OUTPUT
+  Out_StartRelay   : BOOL;    // physical DO to genset starter
+  Out_StopRelay    : BOOL;    // optional stop command
+  Status_Running   : BOOL;
+  Status_Failed    : BOOL;
+  Status_Attempts  : INT;
+END_VAR
+VAR
+  startTimer : TON;
+  runConfirmTimer : TON;
+  retryCounter : INT;
+  seqState : INT; // 0 idle,1 starting,2 running,3 failed
+  maxRetries : INT := 2;
+  startPulseTime : TIME := T#5s;
+  runConfirmTime : TIME := T#10s;
+END_VAR
+
+// default outputs
+Out_StartRelay := FALSE;
+Out_StopRelay := FALSE;
+Status_Failed := FALSE;
+
+// Prevent actions on E-Stop
+IF EStop THEN
+  seqState := 0;
+  retryCounter := 0;
+  Out_StartRelay := FALSE;
+  Status_Running := FALSE;
+  Status_Failed := TRUE;
+  RETURN;
+END_IF
+
+// Start logic: triggered by AutoStartRequest OR ManualStartCmd
+CASE seqState OF
+  0: // idle
+    Status_Running := FALSE;
+    Status_Failed := FALSE;
+    IF AutoStartRequest OR ManualStartCmd THEN
+      seqState := 1; // go to starting
+      retryCounter := 0;
+    END_IF
+  1: // starting: pulse start relay
+    Out_StartRelay := TRUE;
+    startTimer(IN := TRUE, PT := startPulseTime);
+    IF startTimer.Q THEN
+      Out_StartRelay := FALSE;
+      startTimer(IN := FALSE);
+      seqState := 2; // wait for run feedback
+      runConfirmTimer(IN := TRUE, PT := runConfirmTime);
+    END_IF
+  2: // waiting for run confirm
+    IF Generator_RunFeedback THEN
+      Status_Running := TRUE;
+      seqState := 0; // back to idle with running true
+    ELSIF runConfirmTimer.Q THEN
+      // failed to start
+      retryCounter := retryCounter + 1;
+      IF retryCounter > maxRetries THEN
+        Status_Failed := TRUE;
+        seqState := 3; // failed
+      ELSE
+        seqState := 1; // retry
+      END_IF
+      runConfirmTimer(IN := FALSE);
+    END_IF
+  3: // failed
+    Status_Running := FALSE;
+    Out_StopRelay := TRUE; // ensure stop
+    // only manual reset allowed (not implemented here)
+END_CASE
+
+END_FUNCTION_BLOCK
+
+// ---------------------- FB: VFD Controller ----------------------
+// Responsibilities:
+//  - Translate pump demand into VFD frequency (% or Hz)
+//  - Send Start/Stop/Setpoint to VFD via communication
+//  - Read VFD fault & current and pass to alarm manager
+
+FUNCTION_BLOCK FB_VFD_Controller
+VAR_INPUT
+  Enable  : BOOL; // enable pump
+  SpeedDemand_pct : REAL; // 0..100%
+END_VAR
+VAR_OUTPUT
+  VFD_StartCmd : BOOL;
+  VFD_StopCmd  : BOOL;
+  VFD_SpeedSetpoint : REAL; // actual setpoint to send to VFD
+  VFD_Fault    : BOOL;
+  VFD_Current  : REAL; // readback
+END_VAR
+VAR
+  rampTimer : R_TRIG;
+END_VAR
+
+// Simple translation
+IF Enable THEN
+  VFD_StartCmd := TRUE;
+  VFD_StopCmd := FALSE;
+  // apply ramp/hysteresis if needed
+  IF SpeedDemand_pct < 1.0 THEN
+    VFD_SpeedSetpoint := 0.0;
+  ELSE
+    VFD_SpeedSetpoint := SpeedDemand_pct; // 0..100
+  END_IF
+ELSE
+  VFD_StartCmd := FALSE;
+  VFD_StopCmd := TRUE;
+  VFD_SpeedSetpoint := 0.0;
+END_IF
+
+// VFD communication implementation details:
+// In TIA Portal, configure a Modbus TCP/Profinet communication block or use built-in S7 comms
+// Example: write register for frequency setpoint, write bit for run/stop, read fault bit
+
+END_FUNCTION_BLOCK
+
+// ---------------------- FB: Solar Cleaner ----------------------
+// Responsibilities:
+//  - Monitor dust sensor and schedule auto-clean events
+//  - Avoid cleaning during rain / low water alarms / E-Stop
+
+FUNCTION_BLOCK FB_SolarCleaner
+VAR_INPUT
+  DustDetected : BOOL;
+  WaterAvailable : BOOL;
+  EStop : BOOL;
+  CleanInterval : TIME; // e.g., T#12h
+END_VAR
+VAR_OUTPUT
+  SprayCmd : BOOL;
+  LastClean_TS : DATE_AND_TIME;
+END_VAR
+VAR
+  intervalTimer : TON;
+  cleaning : BOOL;
+END_VAR
+
+IF EStop THEN
+  SprayCmd := FALSE;
+  RETURN;
+END_IF
+
+// If dust detected and water available and not recently cleaned -> spray
+IF DustDetected AND WaterAvailable THEN
+  SprayCmd := TRUE; // a short pulse handled by output logic
+  // set LastClean_TS externally when cleaning finished
+ELSE
+  SprayCmd := FALSE;
+END_IF
+
+END_FUNCTION_BLOCK
+
+// ---------------------- FB: Alarm Manager ----------------------
+FUNCTION_BLOCK FB_AlarmManager
+VAR_INPUT
+  EStop : BOOL;
+  VFD_Fault : BOOL;
+  Gen_Failed : BOOL;
+  Battery_SOC : REAL;
+END_VAR
+VAR_OUTPUT
+  Alarm_Buzzer : BOOL;
+  Alarm_Code : INT;
+  Alarm_Text : STRING[120];
+END_VAR
+VAR
+END_VAR
+
+Alarm_Buzzer := FALSE;
+Alarm_Code := 0;
+Alarm_Text := '';
+
+IF EStop THEN
+  Alarm_Buzzer := TRUE;
+  Alarm_Code := 900;
+  Alarm_Text := 'Emergency Stop Activated';
+  RETURN;
+END_IF
+IF VFD_Fault THEN
+  Alarm_Buzzer := TRUE;
+  Alarm_Code := 101;
+  Alarm_Text := 'VFD Fault - check drive';
+  RETURN;
+END_IF
+IF Gen_Failed THEN
+  Alarm_Buzzer := TRUE;
+  Alarm_Code := 201;
+  Alarm_Text := 'Generator failed to start';
+  RETURN;
+END_IF
+IF Battery_SOC < 15.0 THEN
+  Alarm_Buzzer := TRUE;
+  Alarm_Code := 301;
+  Alarm_Text := 'Battery critically low';
+  RETURN;
+END_IF
+
+END_FUNCTION_BLOCK
+
+// ---------------------- OB1 (main cyclic) ----------------------
+// Simplified main program: gather inputs, call FBs and map outputs
+// In TIA Portal create DBs to hold persistent values and configure FB instances
+
+// Example pseudo-call sequence (illustrative):
+// VAR
+//   pwrMgr : FB_PowerManager;
+//   genCtrl : FB_GeneratorController;
+//   vfdCtrl : FB_VFD_Controller;
+//   cleaner : FB_SolarCleaner;
+//   alarmMgr : FB_AlarmManager;
+// END_VAR
+
+// In OB1 cyclic:
+// 1) Read sensor inputs into variables
+// 2) Call pwrMgr(PV_power_kW := .., Battery_SOC := .., Grid_Avail := .., ...)
+// 3) Call genCtrl(AutoStartRequest := pwrMgr.Cmd_Start_Generator, ManualStartCmd := ..)
+// 4) Translate pwrMgr commands to physical DOs with safety interlocks & dead-time
+// 5) Call vfdCtrl(Enable := (pwrMgr.SelectedSource in [src_Solar, src_Battery, src_Grid, src_Generator]) AND NOT EStop,
+//                SpeedDemand_pct := computed_from_level_or_HMI)
+// 6) Call cleaner(DustDetected := DI_SolarDust, WaterAvailable := ..)
+// 7) Call alarmMgr(EStop := DI_EStop, VFD_Fault := vfdCtrl.VFD_Fault, ...)
+// 8) Write DOs to outputs
+
+/*
+Example switching safety pattern (pseudocode):
+ - When switching from source A to source B:
+   1) Open contactor for A
+   2) Wait for confirmation (e.g., voltage/current drop)
+   3) Close contactor for B
+   4) Wait for confirmation
+ - Never close two main contactors at the same time.
+ - Use timers to prevent rapid toggling (anti-chatter).
+*/
+
+// ---------------------- HMI / SCADA Tag suggestions ----------------------
+// - PV_Power (kW), PV_Voltage (V), PV_Current (A)
+// - Battery_SOC (%), Battery_Voltage (V), Battery_Current (A)
+// - Grid_Voltage (V), Grid_Frequency (Hz), Grid_Available (bool)
+// - Generator_Status (Idle/Starting/Running/Failed)
+// - SelectedSource (enum), ReasonText
+// - VFD_SpeedSetpoint (%), Pump_Current (A), Pump_Status
+// - Alarms: list with timestamps and acknowledgment
+// - Manual controls: Force_Gen_Start, Force_Grid, Force_Battery, Stop_Pump, Start_Pump
+
+// ---------------------- Commissioning & Test Checklist ----------------------
+// 1) Validate all DI/DO wiring and I/O addresses
+// 2) Simulate PV and battery sensors into PLC (use simulation mode) and verify selection logic
+// 3) Verify generator start sequence with safety interlocks and no-load tests
+// 4) Validate contactor interlocks: measure that no two primary contactors close simultaneously
+// 5) Validate VFD comms: setpoint, start/stop and readback of current & faults
+// 6) Test solar cleaning logic with dust sensor simulation and ensure proper water spraying timeout
+// 7) Test all alarms and HMI ack flow
+// 8) Perform full system test scenarios: Daytime solar supply, evening battery supply, grid failure, generator auto-start
+
+/*
+---------------------- Notes & Next Steps ----------------------
+- You can copy-paste these FB templates into TIA Portal and implement IO tag names matching your IO modules.
+- Tune thresholds (PV min power, battery SOC levels, grid OK limits) into DB_Config and provide HMI knobs for adjustment.
+- Consider adding data-logging (DB to CSV or OPC UA historian) for analytics and warranty evidence.
+- For safety-critical items (e.g., electrical interlocks), use hardware interlocks and redundant checks. Software should never be the only safeguard.
+*/
+
+// End of document
